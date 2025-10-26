@@ -22,7 +22,6 @@ ExternalProject_Add(wayland_protocols
     PREFIX ${CMAKE_BINARY_DIR}/wayland_protocols
 )
 
-# 2. wlr-screencopy-unstable-v1.xml (wlroots)
 ExternalProject_Add(wlroots_protocols
     GIT_REPOSITORY https://gitlab.freedesktop.org/wlroots/wlroots.git
     GIT_TAG master

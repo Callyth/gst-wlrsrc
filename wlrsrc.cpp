@@ -567,7 +567,7 @@ GST_PLUGIN_DEFINE(
     wlrsrc,
     "Wayland video input using zwlr_screencopy_manager_v1 and zwp_linux_dmabuf_v1",
     wlrsrc_init,
-    "1.0",
+    "0.1",
     "LGPL",
     "Wlrsrc",
     "https://github.com/gst-wlrsrc")
