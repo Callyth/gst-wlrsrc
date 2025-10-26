@@ -44,6 +44,11 @@ GST_DEBUG_CATEGORY_STATIC(wlr_src_debug);
 
 enum
 {
+    LAST_SIGNAL
+};
+
+enum
+{
     PROP_0,
     PROP_DMABUF,
     PROP_SHOW_CURSOR,
@@ -63,6 +68,7 @@ typedef struct _GstWlrSrc
     struct zwp_linux_dmabuf_v1 *dmabuf = NULL;
     struct zwp_linux_buffer_params_v1 *params = NULL;
     GstAllocator *dmabuf_alloc = NULL;
+    GstCaps *caps = NULL;
     gbm_device *gbm = NULL;
     gbm_bo *bo = NULL;
     void *shm_map = NULL;
@@ -83,12 +89,16 @@ typedef struct _GstWlrSrc
 typedef struct _GstWlrSrcClass
 {
     GstPushSrcClass parent_class;
+    GstPad *srcpad;
 } GstWlrSrcClass;
 
 #define GST_TYPE_WLR_SRC (gst_wlr_src_get_type())
+#define gst_wlr_src_parent_class parent_class
 G_DEFINE_TYPE(GstWlrSrc, gst_wlr_src, GST_TYPE_PUSH_SRC)
 
-static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw(memory:DMABuf),format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1];video/x-raw,format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1]"));
+GST_ELEMENT_REGISTER_DEFINE(wlrsrc, "wlrsrc", GST_RANK_NONE, GST_TYPE_WLR_SRC);
+
+static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw(memory:DMABuf),format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1];video/x-raw,format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1]"));
 
 static void gst_wlr_src_set_property(GObject *object, guint prop_id,
                                      const GValue *value, GParamSpec *pspec)
@@ -109,8 +119,9 @@ static void gst_wlr_src_set_property(GObject *object, guint prop_id,
     }
 }
 
-static void gst_wlr_src_get_property(GObject *object, guint prop_id,
-                                     GValue *value, GParamSpec *pspec)
+static void
+gst_wlr_src_get_property(GObject *object, guint prop_id,
+                         GValue *value, GParamSpec *pspec)
 {
     GstWlrSrc *self = (GstWlrSrc *)object;
 
@@ -194,15 +205,15 @@ static bool find_render_node(char *render_node, size_t max_length)
 static void set_caps(GstWlrSrc *self)
 {
     self->buffer_size = self->stride * self->height;
-    GstCaps *caps = gst_caps_new_simple(
+    g_print("width=%zu, height=%d, stride=%d, buffer_size=%zu\n", self->width, self->height, self->stride, self->buffer_size);
+    self->caps = gst_caps_new_simple(
         "video/x-raw",
         "format", G_TYPE_STRING, "BGRx",
         "width", G_TYPE_INT, self->width,
         "height", G_TYPE_INT, self->height,
         "framerate", GST_TYPE_FRACTION, 0, 1,
         NULL);
-    gst_base_src_set_caps(GST_BASE_SRC(self), caps);
-    gst_caps_unref(caps);
+    gst_base_src_set_caps(GST_BASE_SRC(self), self->caps);
 }
 
 static void frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format, uint32_t width, uint32_t height, uint32_t stride)
@@ -473,6 +484,10 @@ static gboolean gst_wlr_src_close(GstBaseSrc *src)
     {
         zwlr_screencopy_manager_v1_destroy(self->manager);
     }
+    if (self->caps)
+    {
+        gst_caps_unref(self->caps);
+    }
     if (self->is_dmabuf)
     {
         if (self->bo)
@@ -552,13 +567,17 @@ static void gst_wlr_src_class_init(GstWlrSrcClass *klass)
             TRUE, G_PARAM_READWRITE));
 
     gst_element_class_set_static_metadata(GST_ELEMENT_CLASS(klass), "wlroots video source", "Source/Video", "Creates a video stream", "Kaliban <Callyth@users.noreply.github.com>");
-    gst_element_class_add_static_pad_template(GST_ELEMENT_CLASS(klass), &src_template);
+    gst_element_class_add_static_pad_template(GST_ELEMENT_CLASS(klass), &src_factory);
+
+    klass->srcpad = gst_pad_new_from_static_template(&src_factory, "src");
+    GST_PAD_SET_PROXY_CAPS(klass->srcpad);
+    gst_element_add_pad(GST_ELEMENT(klass), klass->srcpad);
 }
 
 extern "C" gboolean wlrsrc_init(GstPlugin *plugin)
 {
     GST_DEBUG_CATEGORY_INIT(wlr_src_debug, "wlrsrc", 0, "Wayland wlroots video source");
-    return gst_element_register(plugin, "wlrsrc", GST_RANK_NONE, GST_TYPE_WLR_SRC);
+    return GST_ELEMENT_REGISTER(wlrsrc, plugin);
 }
 
 GST_PLUGIN_DEFINE(
@@ -570,4 +589,4 @@ GST_PLUGIN_DEFINE(
     "0.1",
     "LGPL",
     "Wlrsrc",
-    "https://github.com/gst-wlrsrc")
+    "https://github.com/Callyth/gst-wlrsrc")
