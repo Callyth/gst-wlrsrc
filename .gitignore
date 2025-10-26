@@ -41,9 +41,9 @@
 *.dwo
 
 # cmake
-/build/
-/CMakeFiles/
-/Makefile
+build/
+CMakeFiles/
+Makefile
 
 # vscode
 .vscode/
