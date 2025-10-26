@@ -48,3 +48,7 @@ GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-launch-1.0 wlrsrc dmabuf=true s
 
 - [screencopy-dmabuf.c](https://gitlab.freedesktop.org/wlroots/wlroots/-/blob/0.16/examples/screencopy-dmabuf.c)
 - [wayland document](https://wayland.app)
+
+## Screenshot
+
+![](https://i.imgur.com/Hi8b0VW.png)
