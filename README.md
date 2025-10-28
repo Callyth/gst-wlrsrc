@@ -1,7 +1,5 @@
 # Wayland wlroots video source
 
-## What's this
-
 A small GStreamer plugin for capturing the display on Wayland.
 
 It requires support for the `zwlr_screencopy_manager_v1` (and `zwp_linux_dmabuf_v1` when using DMABuf) protocol(s) to capture.
@@ -34,7 +32,7 @@ GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-inspect-1.0 wlrsrc
 #Note: You may need to insert queue elements between stages to avoid underflow.
 GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-launch-1.0 wlrsrc dmabuf=false show_cursor=false ! queue ! waylandsink
 
-GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-launch-1.0 wlrsrc dmabuf=true show_cursor=true ! video/x-raw,width=1920,height=1080 ! vaapipostproc ! vaapih264enc ! filesink location=test.mp4
+GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 GST_DEBUG_DUMP_DOT_DIR=tmp gst-launch-1.0 wlrsrc dmabuf=true ! queue ! vapostproc ! vah264enc bitrate=3000 ! vah264dec ! vapostproc ! waylandsink
 ```
 
 ## TODO
@@ -43,6 +41,7 @@ GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0 gst-launch-1.0 wlrsrc dmabuf=true s
 - Support multi-display setups
 - Output formats other than BGRx
 - Fix various bugs
+- Implement a time stamp
 
 ## References
 

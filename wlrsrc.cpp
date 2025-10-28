@@ -69,17 +69,23 @@ typedef struct _GstWlrSrc
     struct zwp_linux_buffer_params_v1 *params = NULL;
     GstAllocator *dmabuf_alloc = NULL;
     GstCaps *caps = NULL;
+    GstPad *srcpad = NULL;
     gbm_device *gbm = NULL;
     gbm_bo *bo = NULL;
     void *shm_map = NULL;
     GstMapInfo info;
     GstSegment segment;
-    uint32_t width;
-    uint32_t height;
+    uint32_t width = 0;
+    uint32_t old_width = 0;
+    uint32_t height = 0;
+    uint32_t old_height = 0;
     uint32_t stride;
     uint32_t buffer_size;
-    uint32_t format;
-    bool got_ready = false;
+    uint32_t format = 0;
+    uint32_t old_format = 0;
+    char *output_name;
+    char *description;
+    bool frame_failed = false;
     int fd = -1;
     int drm_fd = -1;
     bool is_dmabuf;
@@ -89,7 +95,6 @@ typedef struct _GstWlrSrc
 typedef struct _GstWlrSrcClass
 {
     GstPushSrcClass parent_class;
-    GstPad *srcpad;
 } GstWlrSrcClass;
 
 #define GST_TYPE_WLR_SRC (gst_wlr_src_get_type())
@@ -98,7 +103,8 @@ G_DEFINE_TYPE(GstWlrSrc, gst_wlr_src, GST_TYPE_PUSH_SRC)
 
 GST_ELEMENT_REGISTER_DEFINE(wlrsrc, "wlrsrc", GST_RANK_NONE, GST_TYPE_WLR_SRC);
 
-static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw(memory:DMABuf),format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1];video/x-raw,format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1]"));
+static GstStaticPadTemplate src_factory = GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={(string)BGRx},width=[1,2147483647],height=[1,2147483647],framerate=[0/1,2147483647/1];"
+                                                                                                                      "video/x-raw,format=BGRx,width=[1,2147483646],height=[1,2147483646],framerate=[0/1,2147483647/1]"));
 
 static void gst_wlr_src_set_property(GObject *object, guint prop_id,
                                      const GValue *value, GParamSpec *pspec)
@@ -144,7 +150,7 @@ static void param_created(void *data, zwp_linux_buffer_params_v1 *param, wl_buff
     GstWlrSrc *self = (GstWlrSrc *)data;
     if (self->wlbuf)
     {
-        wl_buffer_destroy(self->wlbuf);
+        // wl_buffer_destroy(self->wlbuf);
     }
     self->wlbuf = buffer;
     zwlr_screencopy_frame_v1_copy(self->frame, self->wlbuf);
@@ -162,6 +168,7 @@ static const struct zwp_linux_buffer_params_v1_listener param_listener = {
 
 static int make_shm_fd(size_t size, void **out_map)
 {
+    // set fd
     int fd = syscall(SYS_memfd_create, "wlrsrc", MFD_CLOEXEC);
     if (fd < 0)
         return -1;
@@ -170,6 +177,8 @@ static int make_shm_fd(size_t size, void **out_map)
         close(fd);
         return -1;
     }
+
+    // map shm
     void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED)
     {
@@ -185,14 +194,17 @@ static bool find_render_node(char *render_node, size_t max_length)
     bool result = false;
     drmDevicePtr devices[64];
 
+    // list devices
     int n = drmGetDevices2(0, devices, (int)(sizeof(devices) / sizeof(devices[0])));
     for (int i = 0; i < n; i++)
     {
         drmDevice *dev = devices[i];
+
         if (!(dev->available_nodes & (1 << DRM_NODE_RENDER)))
         {
             continue;
         }
+
         strncpy(render_node, dev->nodes[DRM_NODE_RENDER], max_length - 1);
         render_node[max_length - 1] = '\0';
         result = true;
@@ -201,60 +213,36 @@ static bool find_render_node(char *render_node, size_t max_length)
     drmFreeDevices(devices, n);
     return result;
 }
-
 static void set_caps(GstWlrSrc *self)
 {
     self->buffer_size = self->stride * self->height;
-    g_print("width=%zu, height=%d, stride=%d, buffer_size=%zu\n", self->width, self->height, self->stride, self->buffer_size);
-    self->caps = gst_caps_new_simple(
-        "video/x-raw",
-        "format", G_TYPE_STRING, "BGRx",
-        "width", G_TYPE_INT, self->width,
-        "height", G_TYPE_INT, self->height,
-        "framerate", GST_TYPE_FRACTION, 0, 1,
-        NULL);
-    gst_base_src_set_caps(GST_BASE_SRC(self), self->caps);
-}
-
-static void frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format, uint32_t width, uint32_t height, uint32_t stride)
-{
-    GstWlrSrc *self = (GstWlrSrc *)data;
-    if (!self->is_dmabuf && !self->format)
+    GST_DEBUG_OBJECT(self, "Buffer size:%zu", self->buffer_size);
+    if (self->is_dmabuf && false)
     {
-        self->format = format;
-        self->width = width;
-        self->height = height;
-        self->stride = stride;
-        set_caps(self);
-        GST_DEBUG_OBJECT(self, "Frame width=%u height=%u", self->width, self->height);
-        self->fd = make_shm_fd(self->buffer_size, &self->shm_map);
-        if (!self->fd)
-        {
-            GST_ERROR_OBJECT(self, "Failed to create fd");
-            return;
-        }
-        self->pool = wl_shm_create_pool(self->shm, self->fd, self->buffer_size);
-        if (!self->pool)
-        {
-            GST_ERROR_OBJECT(self, "Failed to create pool");
-            return;
-        }
-        self->wlbuf = wl_shm_pool_create_buffer(self->pool, 0, self->width, self->height, self->stride, self->format);
-        if (!self->wlbuf)
-        {
-            GST_ERROR_OBJECT(self, "Failed to create wlbuf");
-            return;
-        }
+        self->caps = gst_caps_new_simple(
+            "video/x-raw(memory:DMABuf)",
+            "format", G_TYPE_STRING, "DMA_DRM",
+            "drm-format", G_TYPE_STRING, "BGRx",
+            "width", G_TYPE_INT, self->width,
+            "height", G_TYPE_INT, self->height,
+            "framerate", GST_TYPE_FRACTION, 0, 1,
+            NULL);
     }
+    else
+    {
+        self->caps = gst_caps_new_simple(
+            "video/x-raw",
+            "format", G_TYPE_STRING, "BGRx",
+            "width", G_TYPE_INT, self->width,
+            "height", G_TYPE_INT, self->height,
+            "framerate", GST_TYPE_FRACTION, 0, 1,
+            NULL);
+    }
+    gst_base_src_set_caps(GST_BASE_SRC(self), self->caps);
 }
 
 static void frame_flags(void *data, struct zwlr_screencopy_frame_v1 *frame,
                         uint32_t flags)
-{
-    //
-}
-
-static void frame_failed(void *data, struct zwlr_screencopy_frame_v1 *frame)
 {
     //
 }
@@ -264,71 +252,49 @@ static void frame_damage(void *data, struct zwlr_screencopy_frame_v1 *frame, uin
     //
 }
 
+static void frame_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *frame)
+{
+    //
+}
+
+static void frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format, uint32_t width, uint32_t height, uint32_t stride)
+{
+    GstWlrSrc *self = (GstWlrSrc *)data;
+    if (!self->is_dmabuf)
+    {
+        self->format = format;
+        GST_DEBUG_OBJECT(self, "Format:%u", self->format);
+        self->width = width;
+        self->height = height;
+        self->stride = stride;
+        GST_DEBUG_OBJECT(self, "Frame width=%u height=%u", self->width, self->height);
+    }
+}
+
 static void frame_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t format, uint32_t width, uint32_t height)
 
 {
     GstWlrSrc *self = (GstWlrSrc *)data;
-    if (self->is_dmabuf && !self->format)
+    if (self->is_dmabuf)
     {
         self->format = format;
+        GST_DEBUG_OBJECT(self, "Format:%u", self->format);
         self->width = width;
         self->height = height;
         GST_DEBUG_OBJECT(self, "Frame width=%u height=%u", self->width, self->height);
-        if (!self->bo)
-        {
-            self->bo = gbm_bo_create(self->gbm, self->width, self->height, self->format, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
-            if (!self->bo)
-            {
-                GST_ERROR_OBJECT(self, "Failed to create GBM BO");
-                return;
-            }
-            self->stride = gbm_bo_get_stride(self->bo);
-            set_caps(self);
-            self->fd = gbm_bo_get_fd(self->bo);
-            if (self->fd < 0)
-            {
-                GST_ERROR_OBJECT(self, "Failed to get GBM FD");
-                return;
-            }
-            self->dmabuf_alloc = gst_dmabuf_allocator_new();
-            if (!self->dmabuf_alloc)
-            {
-                GST_ERROR_OBJECT(self, "ailed to set dmabuf alloc");
-                return;
-            }
-        }
-    }
-}
-
-static void frame_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *frame)
-{
-    GstWlrSrc *self = (GstWlrSrc *)data;
-    if (self->is_dmabuf)
-    {
-
-        if (self->params)
-        {
-            zwp_linux_buffer_params_v1_destroy(self->params);
-        }
-        self->params = zwp_linux_dmabuf_v1_create_params(self->dmabuf);
-
-        uint32_t offset = gbm_bo_get_offset(self->bo, 0);
-        self->stride = gbm_bo_get_stride(self->bo);
-        uint64_t modifier = gbm_bo_get_modifier(self->bo);
-        zwp_linux_buffer_params_v1_add(self->params, self->fd, 0, offset, self->stride, modifier >> 32, modifier & 0xffffffff);
-        zwp_linux_buffer_params_v1_add_listener(self->params, &param_listener, self);
-        zwp_linux_buffer_params_v1_create(self->params, self->width, self->height, self->format, 0);
-    }
-    else
-    {
-        zwlr_screencopy_frame_v1_copy(self->frame, self->wlbuf);
     }
 }
 
 static void frame_ready(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec)
 {
     GstWlrSrc *self = (GstWlrSrc *)data;
-    self->got_ready = true;
+    self->frame_failed = false;
+}
+
+static void frame_failed(void *data, struct zwlr_screencopy_frame_v1 *frame)
+{
+    GstWlrSrc *self = (GstWlrSrc *)data;
+    self->frame_failed = true;
 }
 
 static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
@@ -339,6 +305,7 @@ static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
     .damage = frame_damage,
     .linux_dmabuf = frame_linux_dmabuf,
     .buffer_done = frame_buffer_done};
+
 static void dmabuf_format(void *data, zwp_linux_dmabuf_v1 *dmabuf, uint32_t format)
 {
     // Is this used?
@@ -352,32 +319,94 @@ static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
     .format = dmabuf_format,
     .modifier = dmabuf_modifier};
 
+static void output_geometry(void *data, struct wl_output *wl_output,
+                            int32_t x, int32_t y,
+                            int32_t physical_width, int32_t physical_height,
+                            int32_t subpixel, const char *make,
+                            const char *model, int32_t transform)
+{
+    //
+}
+
+static void output_mode(void *data, struct wl_output *wl_output,
+                        uint32_t flags, int32_t width, int32_t height, int32_t refresh)
+{
+    //
+}
+
+static void output_done(void *data, struct wl_output *wl_output)
+{
+    //
+}
+
+static void output_scale(void *data, struct wl_output *wl_output, int32_t factor)
+{
+    //
+}
+
+static void output_name(void *data, struct wl_output *output, const char *name)
+{
+    GstWlrSrc *self = (GstWlrSrc *)data;
+    self->output_name = strdup(name);
+    GST_DEBUG_OBJECT(self, "output name:%s", self->output_name);
+}
+
+static void output_description(void *data, struct wl_output *output, const char *description)
+{
+    GstWlrSrc *self = (GstWlrSrc *)data;
+    self->description = strdup(description);
+    GST_DEBUG_OBJECT(self, "description:%s", self->description);
+};
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
+    .name = output_name,
+    .description = output_description,
+};
+
 void registory_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
 {
     GstWlrSrc *self = (GstWlrSrc *)data;
+
     if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0 && self->is_dmabuf)
     {
         self->dmabuf = (struct zwp_linux_dmabuf_v1 *)wl_registry_bind(registry, name, &zwp_linux_dmabuf_v1_interface, version);
         zwp_linux_dmabuf_v1_add_listener(self->dmabuf, &dmabuf_listener, self);
         wl_display_roundtrip(self->display);
     }
-    else if (strcmp(interface, "wl_shm") == 0 && !self->is_dmabuf)
+    else if (strcmp(interface, wl_shm_interface.name) == 0 && !self->is_dmabuf)
     {
         self->shm = (struct wl_shm *)wl_registry_bind(registry, name, &wl_shm_interface, version);
     }
-    else if (strcmp(interface, "zwlr_screencopy_manager_v1") == 0)
+    else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0)
     {
         self->manager = (struct zwlr_screencopy_manager_v1 *)wl_registry_bind(registry, name, &zwlr_screencopy_manager_v1_interface, version);
     }
-    else if (strcmp(interface, "wl_output") == 0)
+    else if (strcmp(interface, wl_output_interface.name) == 0)
     {
         self->output = (struct wl_output *)wl_registry_bind(registry, name, &wl_output_interface, version);
+        wl_output_add_listener(self->output, &output_listener, self);
     }
+};
+
+void registry_remove(void *data, wl_registry *registry, uint32_t name) {
+    //
+};
+
+static const struct wl_registry_listener registry_listener = {
+    .global = registory_global,
+    .global_remove = registry_remove,
 };
 
 static void gst_wlr_src_init(GstWlrSrc *self)
 {
+    // init environment
     self->show_cursor = 1;
+
+    // set live mode
     gst_segment_init(&self->segment, GST_FORMAT_TIME);
     gst_base_src_set_format(GST_BASE_SRC(self), GST_FORMAT_TIME);
     gst_base_src_set_live(GST_BASE_SRC(self), TRUE);
@@ -387,10 +416,12 @@ static void gst_wlr_src_init(GstWlrSrc *self)
 static gboolean gst_wlr_src_start(GstBaseSrc *src)
 {
     GstWlrSrc *self = (GstWlrSrc *)src;
+    // init dmabuf
     if (self->is_dmabuf)
     {
         GST_DEBUG_OBJECT(self, "dmabuf mode");
 
+        // create gbm device
         char render_node[256];
         if (!find_render_node(render_node, sizeof(render_node)))
         {
@@ -398,6 +429,7 @@ static gboolean gst_wlr_src_start(GstBaseSrc *src)
             return FALSE;
         }
         GST_DEBUG_OBJECT(self, "Render node=%s", render_node);
+
         self->drm_fd = open(render_node, O_RDWR);
         self->gbm = gbm_create_device(self->drm_fd);
         if (!self->gbm)
@@ -411,23 +443,28 @@ static gboolean gst_wlr_src_start(GstBaseSrc *src)
         GST_DEBUG_OBJECT(self, "shm mode");
     }
 
+    // connect to display
     self->display = wl_display_connect(NULL);
     if (!self->display)
     {
         GST_ERROR_OBJECT(self, "Failed to connect to Wayland display");
         return FALSE;
     }
+
+    // get registry
     self->registry = wl_display_get_registry(self->display);
-    if (!self->registry)
+    wl_registry_add_listener(self->registry, &registry_listener, self);
+    wl_display_roundtrip(self->display);
+    if (!self->manager)
     {
-        GST_ERROR_OBJECT(self, "Failed to get registry");
+        GST_ERROR_OBJECT(self, "Failed to bind to screencopy manager");
         return FALSE;
     }
-    static const struct wl_registry_listener registry_listener = {
-        .global = registory_global,
-        .global_remove = NULL,
-    };
-    wl_registry_add_listener(self->registry, &registry_listener, self);
+    if (!self->output)
+    {
+        GST_ERROR_OBJECT(self, "Failed to bind to wl_output");
+        return FALSE;
+    }
     wl_display_roundtrip(self->display);
     return TRUE;
 }
@@ -435,43 +472,139 @@ static gboolean gst_wlr_src_start(GstBaseSrc *src)
 static GstFlowReturn gst_wlr_src_create(GstPushSrc *src, GstBuffer **buf)
 {
     GstWlrSrc *self = (GstWlrSrc *)src;
-    self->got_ready = FALSE;
 
+    // request frame
     self->frame = zwlr_screencopy_manager_v1_capture_output(self->manager, self->show_cursor, self->output);
     zwlr_screencopy_frame_v1_add_listener(self->frame, &frame_listener, self);
 
-    while (!self->got_ready)
+    wl_display_roundtrip(self->display);
+
+    if (self->frame_failed)
     {
-        if (wl_display_dispatch(self->display) == -1)
-            break;
+        GST_ERROR_OBJECT(self, "Failed to get frame");
+        return GST_FLOW_ERROR;
     }
 
-    GstBuffer *buffer = NULL;
     if (self->is_dmabuf)
     {
-        buffer = gst_buffer_new();
+        if (self->width != self->old_width || self->height != self->old_height || self->format != self->old_format)
+        {
+            if (self->bo)
+            {
+                gbm_bo_destroy(self->bo);
+                self->bo = NULL;
+            }
+            if (self->wlbuf)
+            {
+                wl_buffer_destroy(self->wlbuf);
+                self->wlbuf = NULL;
+            }
+        }
+        if (!self->bo)
+        {
+            self->old_width = self->width;
+            self->old_height = self->height;
+            self->old_format = self->format;
+            self->bo = gbm_bo_create(self->gbm, self->width, self->height, self->format, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+            if (!self->bo)
+            {
+                GST_ERROR_OBJECT(self, "Failed to create GBM BO");
+                return GST_FLOW_ERROR;
+            }
+
+            // get wlbuf
+            self->params = zwp_linux_dmabuf_v1_create_params(self->dmabuf);
+            self->fd = gbm_bo_get_fd(self->bo);
+            self->stride = gbm_bo_get_stride(self->bo);
+
+            uint32_t offset = gbm_bo_get_offset(self->bo, 0);
+            uint64_t modifier = gbm_bo_get_modifier(self->bo);
+            zwp_linux_buffer_params_v1_add(self->params, self->fd, 0, offset, self->stride, modifier >> 32, modifier & 0xffffffff);
+
+            self->wlbuf = zwp_linux_buffer_params_v1_create_immed(self->params, self->width, self->height, self->format, 0);
+            zwp_linux_buffer_params_v1_destroy(self->params);
+
+            self->dmabuf_alloc = gst_dmabuf_allocator_new();
+            if (!self->dmabuf_alloc)
+            {
+                GST_ERROR_OBJECT(self, "ailed to set dmabuf alloc");
+                return GST_FLOW_ERROR;
+            }
+        }
+        set_caps(self);
+        // copy frame to dmabuf
+        zwlr_screencopy_frame_v1_copy(self->frame, self->wlbuf);
+        wl_display_roundtrip(self->display);
+
+        if (self->frame_failed)
+        {
+            GST_ERROR_OBJECT(self, "Failed to get frame");
+            return GST_FLOW_ERROR;
+        }
+
+        GstBuffer *buffer = gst_buffer_new();
         int gst_fd = dup(self->fd);
         GstMemory *mem = gst_dmabuf_allocator_alloc_with_flags(self->dmabuf_alloc, gst_fd, self->buffer_size, GST_FD_MEMORY_FLAG_NONE);
         gst_buffer_append_memory(buffer, mem);
+
+        *buf = buffer;
     }
     else
     {
-        buffer = gst_buffer_new_and_alloc(self->buffer_size);
+        if (!self->wlbuf)
+        {
+            set_caps(self);
+            self->fd = make_shm_fd(self->buffer_size, &self->shm_map);
+            if (self->fd == -1)
+            {
+                GST_ERROR_OBJECT(self, "Failed to create fd");
+                return GST_FLOW_ERROR;
+            }
+            self->pool = wl_shm_create_pool(self->shm, self->fd, self->buffer_size);
+            if (!self->pool)
+            {
+                GST_ERROR_OBJECT(self, "Failed to create pool");
+                return GST_FLOW_ERROR;
+            }
+            self->wlbuf = wl_shm_pool_create_buffer(self->pool, 0, self->width, self->height, self->stride, self->format);
+            if (!self->wlbuf)
+            {
+                GST_ERROR_OBJECT(self, "Failed to create wlbuf");
+                return GST_FLOW_ERROR;
+            }
+        }
+        zwlr_screencopy_frame_v1_copy(self->frame, self->wlbuf);
+        wl_display_roundtrip(self->display);
+
+        if (self->frame_failed)
+        {
+            GST_ERROR_OBJECT(self, "Failed to get frame");
+            return GST_FLOW_ERROR;
+        }
+
+        GstBuffer *buffer = gst_buffer_new_and_alloc(self->buffer_size);
+
         if (gst_buffer_map(buffer, &self->info, GST_MAP_WRITE))
         {
             memcpy(self->info.data, self->shm_map, self->buffer_size);
             gst_buffer_unmap(buffer, &self->info);
         }
+        else
+        {
+            GST_ERROR_OBJECT(self, "Failed to write buffer");
+            return GST_FLOW_ERROR;
+        }
+        *buf = buffer;
     }
-
-    *buf = buffer;
     zwlr_screencopy_frame_v1_destroy(self->frame);
     self->frame = NULL;
     return GST_FLOW_OK;
 }
+
 static gboolean gst_wlr_src_close(GstBaseSrc *src)
 {
     GstWlrSrc *self = (GstWlrSrc *)src;
+    // Release everything
     if (self->frame)
     {
         zwlr_screencopy_frame_v1_destroy(self->frame);
@@ -568,10 +701,6 @@ static void gst_wlr_src_class_init(GstWlrSrcClass *klass)
 
     gst_element_class_set_static_metadata(GST_ELEMENT_CLASS(klass), "wlroots video source", "Source/Video", "Creates a video stream", "Kaliban <Callyth@users.noreply.github.com>");
     gst_element_class_add_static_pad_template(GST_ELEMENT_CLASS(klass), &src_factory);
-
-    klass->srcpad = gst_pad_new_from_static_template(&src_factory, "src");
-    GST_PAD_SET_PROXY_CAPS(klass->srcpad);
-    gst_element_add_pad(GST_ELEMENT(klass), klass->srcpad);
 }
 
 extern "C" gboolean wlrsrc_init(GstPlugin *plugin)
